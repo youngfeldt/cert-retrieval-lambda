@@ -1,0 +1,97 @@
+use lambda_runtime::{run, service_fn, Error, LambdaEvent};
+use serde::{Deserialize, Serialize};
+use std::env;
+use aws_config::{self, BehaviorVersion};
+use aws_config::meta::region::RegionProviderChain;
+use aws_config::SdkConfig;
+
+#[derive(Deserialize)]
+struct Request {
+    attestation_doc: String,
+}
+
+#[derive(Serialize)]
+struct Response {
+    req_id: String,
+    msg: String,
+    env_config: String, // Assuming you want to return some string representation
+    attestation_doc: String,
+    json_env: String,
+    mtls_secret_arn: String,
+}
+async fn get_secret(config: &SdkConfig, secret_arn: &str) -> Result<serde_json::Value, aws_sdk_secretsmanager::Error> {
+    let asm = aws_sdk_secretsmanager::Client::new(&config);
+
+    let response = asm
+        .get_secret_value()
+        .secret_id(secret_arn)
+        .send()
+        .await?;
+
+    if let Some(secret) = response.secret_string() {
+        println!("Got it");
+        Ok(serde_json::from_str(secret).unwrap())
+    } else {
+        // Handle the case where the secret string is missing
+        println!("No secret string found");
+        Err(aws_sdk_secretsmanager::Error::Unhandled(
+            aws_sdk_secretsmanager::error::GetSecretValueError::builder()
+                .message("Secret string is missing")
+                .build(),
+        ))
+    }
+}
+
+
+
+async fn function_handler(event: LambdaEvent<Request>) -> Result<Response, Error> {
+    // Extract request Information
+    let invoked_function_arn = event.context.invoked_function_arn;
+    let attestation_doc = event.payload.attestation_doc;
+
+    // Get Environment Variable with Location of Secret
+    let json_environment = match env::var_os("JSON_ENVIRONMENT") {
+        Some(v) => v.into_string().unwrap(),
+        None => panic!("$JSON_ENVIRONMENT is not set"),
+    };
+    
+    // Now marshal as JSON and read the value of MTLS Secret
+    let json_val: serde_json::Value = serde_json::from_str(&json_environment).unwrap();
+    let mtls_secret_arn = json_val["MTLS_SECRET_ARN"].as_str().unwrap();
+
+    println!("MTLS_SECRET_ARN: {}", mtls_secret_arn);
+
+    // Now Setup AWS Client to use SDK
+    let region_provider = RegionProviderChain::default_provider().or_else("us-east-1");
+    let config = aws_config::defaults(BehaviorVersion::v2024_03_28())
+        .region(region_provider)
+        .load()
+        .await;
+    let client = Client::new(&config);
+
+    let json_secret = get_secret(&config, mtls_secret_arn).await.unwrap();
+
+    // Access env_config from the event's context
+    let env_config = &event.context.env_config;
+
+    // Assuming env_config has a method to convert to a string or to access its fields
+    let env_config_str = format!("{:?}", env_config); // Convert to string for the response
+
+    // Prepare the response
+    let resp = Response {
+        req_id: event.context.request_id.clone(),
+        msg: format!("Function ARN: {}", invoked_function_arn),
+        env_config: env_config_str, // Pass string representation
+        attestation_doc, // Pass attestation_doc from the request
+        json_env: json_environment,
+        mtls_secret_arn: mtls_secret_arn.to_string(),
+    };
+
+    // Return `Response` (it will be serialized to JSON automatically by the runtime)
+    Ok(resp)
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    run(service_fn(function_handler)).await
+}
