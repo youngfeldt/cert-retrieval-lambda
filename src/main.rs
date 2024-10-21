@@ -6,6 +6,7 @@
 //    a. [Done] Secret ID
 //    b. [pending] List of PCR8 values.  Pending product update.
 // 2. [Pending] Validate Attestation Doc
+//    a. Get PCR values and compare PCR8 to env var. list of allowed PCR8 values.
 // 3. [Done] Retrieve Secret
 // 4. [Done] Retrieve contents of S3 object
 // 5. [Pending] Decode & Decrypt passphrase
@@ -30,6 +31,7 @@ use aws_sdk_secretsmanager::Client as SecretsManagerClient;
 
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
+use serde_json;
 use serde_json::Value;
 use simple_logger::SimpleLogger;
 
@@ -47,7 +49,8 @@ struct Response {
     secret_value: Value,
     enc_p12_keystore: String,
 }
-// Todo #1 
+
+// Todo #1  Read environment variables
 fn get_lambda_env_var() -> Result<Value, lambda_runtime::Error> {
     // Get environment variables; for now, just MTLS cert secret ID.
     // Enhance to also get PCR8 value list.
@@ -60,16 +63,16 @@ fn get_lambda_env_var() -> Result<Value, lambda_runtime::Error> {
     Ok(json_val)
 }
 
-// Todo #2
+// Todo #2 Validate Attestation Document
 async fn validate_attestation_doc(attestation_doc: &str) -> Result<(), lambda_runtime::Error> {
     // Validate attestation document
     // 1. Check that PCR8 value is one of the approved.
     // 2. Validate attestation document with attestation_doc_validation crate.
-    todo!("Validate PCR8 value in attestation document against accepted values in Environment Variable.")
-    todo!("Validate attestation document")
+    todo!("Validate PCR8 value in attestation document against accepted values in Environment Variable.");
+    todo!("Validate attestation document");
 }
 
-// Todo #3 
+// Todo #3  Retrieve secret from secrets manager.
 async fn get_secret(config: &SdkConfig, arn: &str) -> Result<Value, lambda_runtime::Error> {
     let client = SecretsManagerClient::new(&config);
 
@@ -88,7 +91,7 @@ async fn get_secret(config: &SdkConfig, arn: &str) -> Result<Value, lambda_runti
     Ok(json_secret_value)
 }
 
-// Todo #4 
+// Todo #4  Retrieve contents from S3.
 async fn get_contents(config: &SdkConfig, s3_uri: &str) -> Result<String, lambda_runtime::Error> {
     let parts: Vec<&str> = s3_uri.split('/').collect();
     let bucket = parts[2];
@@ -115,7 +118,7 @@ async fn get_contents(config: &SdkConfig, s3_uri: &str) -> Result<String, lambda
     Ok(body_str.to_string())
 }
 
-// Todo: #5
+// Todo: #5 decrypt data with kms
 async fn decrypt_value(data: &String) -> Result<Response, lambda_runtime::Error> {
     todo!("Take value provided and decrypt with --recipient <attestation_doc>")
 }
@@ -134,12 +137,18 @@ async fn function_handler(event: LambdaEvent<Request>) -> Result<Response, lambd
 
     // Get Lambda Environment variables to find MTLS Client Cert Secret
     let lambda_environment_vars = get_lambda_env_var()?;
+
     info!("Lambda Environment Vars: {}", serde_json::to_string_pretty(&lambda_environment_vars).unwrap());
+
     let mtls_secret_arn = lambda_environment_vars["MTLS_SECRET_ARN"]
         .as_str()
-        .ok_or_else(|| lambda_runtime::Error::from("MTLS_SECRET_ARN is missing from JSON"))?;
+        .ok_or_else(|| lambda_runtime::Error::from("MTLS_SECRET_ARN is missing from Environment Variables"))?;
 
-    // Setup AWS Client
+    let enclave_signer_pcr8 = lambda_environment_vars["ENCLAVE_SIGNER"]
+        .as_str()
+        .ok_or_else(|| lambda_runtime::Error::from("ENCLAVE_SIGNER is missing from Environment Variables"))?;
+
+    // Setup AWS Config
     let region_provider = RegionProviderChain::default_provider().or_else("us-east-1");
     let config = aws_config::defaults(BehaviorVersion::v2024_03_28())
         .region(region_provider)
