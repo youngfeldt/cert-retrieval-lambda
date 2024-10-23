@@ -22,18 +22,21 @@
 //================================================================================================================
 use aws_config::meta::region::RegionProviderChain;
 use aws_config::{self, BehaviorVersion, SdkConfig};
-use envars::parse_attestation_document;
-use lambda_runtime::{run, service_fn, LambdaEvent};
-use std::env;
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use base64::Engine;
+use aws_sdk_kms::primitives::Blob;
+use aws_sdk_kms::Client as KmsClient;
+use aws_sdk_kms::types::{RecipientInfo};
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_secretsmanager::Client as SecretsManagerClient;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine;
+use envars::parse_attestation_document;
+use lambda_runtime::{run, service_fn, LambdaEvent};
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use serde_json;
 use serde_json::Value;
 use simple_logger::SimpleLogger;
+use std::env;
 
 #[derive(Deserialize, Serialize)] // Add Serialize here
 struct Request {
@@ -44,11 +47,11 @@ struct Request {
 struct Response {
     invoked_function_arn: String,
     env_config: String,
-    attestation_doc: String,
     json_env: String,
     mtls_secret_arn: String,
     secret_value: Value,
     enc_p12_keystore: String,
+    enc_keystore_passphrase: String,
 }
 
 // Todo #1  Read environment variables
@@ -119,8 +122,38 @@ async fn get_contents(config: &SdkConfig, s3_uri: &str) -> Result<String, lambda
 }
 
 // Todo: #5 decrypt data with kms
-async fn decrypt_value(_data: &String) -> Result<Response, lambda_runtime::Error> {
-    todo!("Take value provided and decrypt with --recipient <attestation_doc>")
+async fn recipient_decrypt(config: &SdkConfig, encrypted_data_base64: &String, attestation_doc_base64: &String) -> Result<String, lambda_runtime::Error> {
+        // Decrypts for recipient.  Returns Base64 decoded value.
+
+    // decode data before passing
+    let encrypted_data = Blob::new(BASE64_STANDARD.decode(encrypted_data_base64.trim())?);
+    let attestation_doc_blob = Blob::new(BASE64_STANDARD.decode(attestation_doc_base64.trim())?);
+    let kms_client = KmsClient::new(&config);
+
+    // Construct RecipientInfo
+    let recipient_info = RecipientInfo::builder()
+        .attestation_document(attestation_doc_blob)
+        .build();
+
+    let decrypt_response = kms_client
+        .decrypt()
+        .ciphertext_blob(encrypted_data)
+        .recipient(recipient_info)
+        .send()  
+        .await
+        .map_err(|e| lambda_runtime::Error::from(format!("Failed to decrypt passphrase: {}", e)))?;
+
+    // Base64 encode before returning
+    if let Some(plaintext) = decrypt_response.plaintext {
+        // Base64 encode the plaintext
+        let base64_encoded = BASE64_STANDARD.encode(plaintext);
+        info!("Base64 encoded value for recipient: {}", base64_encoded);
+        Ok(base64_encoded)
+    } else {
+        error!("Did not get data from decrypt_response.plaintext");
+        Err(lambda_runtime::Error::from("No plaintext in decrypt response"))
+    }
+
 }
 
 // ============ Function Handler ====================================================================
@@ -188,17 +221,22 @@ async fn function_handler(event: LambdaEvent<Request>) -> Result<Response, lambd
         secret_value["p12_keystore_s3_uri"]
             .as_str()
             .ok_or_else(|| lambda_runtime::Error::from("Invalid S3 URI"))?,
-    )
-    .await?;
+    ).await?;
+
+    let keystore_passphrase = recipient_decrypt(
+        &config,
+        &secret_value["keystore_password"].to_string(),
+        &attestation_doc,
+    ).await?;
 
     let resp = Response {
         invoked_function_arn: invoked_function_arn,
         env_config: env_config_str,
-        attestation_doc,
         json_env: lambda_environment_vars.to_string(),
         mtls_secret_arn: mtls_secret_arn.to_string(),
         secret_value: secret_value,
         enc_p12_keystore: enc_p12_keystore,
+        enc_keystore_passphrase: keystore_passphrase,
     };
 
     Ok(resp)
