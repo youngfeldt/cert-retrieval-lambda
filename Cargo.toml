@@ -17,6 +17,14 @@ serde_json = "1.0"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
+# For lib.rs
+aws-nitro-enclaves-cose = "0.5.2"
+base64 = "0.22.1"
+hex = "0.4.3"
+openssl = { version = "0.10", features = ["vendored"] }
+reqwest = { version = "0.11.14", features = ["blocking"] }
+serde_cbor = "0.11.2"
+zip = "2.2.0"
 
 [profile.release]
 opt-level = "z"

@@ -22,13 +22,13 @@
 //================================================================================================================
 use aws_config::meta::region::RegionProviderChain;
 use aws_config::{self, BehaviorVersion, SdkConfig};
+use envars::parse_attestation_document;
 use lambda_runtime::{run, service_fn, LambdaEvent};
 use std::env;
-
-// use aws_sdk_kms::Client as KMSClient;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine;
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_secretsmanager::Client as SecretsManagerClient;
-
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use serde_json;
@@ -39,6 +39,7 @@ use simple_logger::SimpleLogger;
 struct Request {
     attestation_doc: String,
 }
+
 #[derive(Serialize)]
 struct Response {
     invoked_function_arn: String,
@@ -63,13 +64,13 @@ fn get_lambda_env_var() -> Result<Value, lambda_runtime::Error> {
     Ok(json_val)
 }
 
-// Todo #2 Validate Attestation Document
-async fn validate_attestation_doc(attestation_doc: &str) -> Result<(), lambda_runtime::Error> {
+// Todo #2b Validate Attestation Document
+async fn validate_attestation_doc(_attestation_doc: &str) -> Result<(), lambda_runtime::Error> {
     // Validate attestation document
     // 1. Check that PCR8 value is one of the approved.
     // 2. Validate attestation document with attestation_doc_validation crate.
     todo!("Validate PCR8 value in attestation document against accepted values in Environment Variable.");
-    todo!("Validate attestation document");
+    // THEN todo!("Validate attestation document");
 }
 
 // Todo #3  Retrieve secret from secrets manager.
@@ -87,7 +88,6 @@ async fn get_secret(config: &SdkConfig, arn: &str) -> Result<Value, lambda_runti
     let json_secret_value: Value = serde_json::from_str(&secret_value)
         .map_err(|e| lambda_runtime::Error::from(format!("Invalid JSON: {}", e)))?;
 
-    // Ok(secret_value.to_string())
     Ok(json_secret_value)
 }
 
@@ -119,14 +119,13 @@ async fn get_contents(config: &SdkConfig, s3_uri: &str) -> Result<String, lambda
 }
 
 // Todo: #5 decrypt data with kms
-async fn decrypt_value(data: &String) -> Result<Response, lambda_runtime::Error> {
+async fn decrypt_value(_data: &String) -> Result<Response, lambda_runtime::Error> {
     todo!("Take value provided and decrypt with --recipient <attestation_doc>")
 }
 
 // ============ Function Handler ====================================================================
 async fn function_handler(event: LambdaEvent<Request>) -> Result<Response, lambda_runtime::Error> {
-
-    info!( "Processing event: {}", serde_json::to_string_pretty(&event.payload).unwrap());
+    info!("Processing event: {}", serde_json::to_string_pretty(&event.payload).unwrap());
 
     // Get some context about the function
     let env_config_str = format!("{:?}", &event.context.env_config);
@@ -148,6 +147,31 @@ async fn function_handler(event: LambdaEvent<Request>) -> Result<Response, lambd
         .as_str()
         .ok_or_else(|| lambda_runtime::Error::from("ENCLAVE_SIGNER is missing from Environment Variables"))?;
 
+    // Parse Attestation document
+    let attestation_document: &[u8] = &BASE64_STANDARD.decode(attestation_doc.trim())?;
+    let parsed_attestation_json = match parse_attestation_document(attestation_document) {
+        Ok(parsed_json) => {
+            let json_string = serde_json::to_string_pretty(&parsed_json["pcrs"])?;
+            info!("Attestation Document PCR Values: {}", json_string);
+            parsed_json
+        }
+        Err(e) => {
+            error!("Error parsing attestation document: {}", e);
+            return Err(lambda_runtime::Error::from(format!("Error parsing attestation document: {}", e)));
+        }
+    };
+
+    // Extract PCR8 value from attestation JSON and require pre-approved value match
+    let doc_pcr8 = parsed_attestation_json["pcrs"]["8"].as_str()
+        .ok_or_else(|| lambda_runtime::Error::from("PCR8 value not found in attestation document"))?;
+
+    // TODO: make this membership instead of equality (will have list, even if its a list of one.)
+    if doc_pcr8.ne(enclave_signer_pcr8) {
+        error!("PCR8 value from Attestation Document does not match required value.");
+        return Err(lambda_runtime::Error::from("PCR8 value from Attestation Document does not match expected value."));
+    }
+
+    // Now prep for AWS functions //
     // Setup AWS Config
     let region_provider = RegionProviderChain::default_provider().or_else("us-east-1");
     let config = aws_config::defaults(BehaviorVersion::v2024_03_28())
@@ -159,8 +183,6 @@ async fn function_handler(event: LambdaEvent<Request>) -> Result<Response, lambd
     let secret_value = get_secret(&config, mtls_secret_arn).await?;
 
     // Get Keystore.p12 from Secret
-    // let keystore_p12 = secret_value["keystore.p12"].as_str().unwrap_or("No value!");
-
     let enc_p12_keystore = get_contents(
         &config,
         secret_value["p12_keystore_s3_uri"]
@@ -173,7 +195,7 @@ async fn function_handler(event: LambdaEvent<Request>) -> Result<Response, lambd
         invoked_function_arn: invoked_function_arn,
         env_config: env_config_str,
         attestation_doc,
-        json_env: lambda_environment_vars.to_string(), // Use the result from `get_lambda_env_var`
+        json_env: lambda_environment_vars.to_string(),
         mtls_secret_arn: mtls_secret_arn.to_string(),
         secret_value: secret_value,
         enc_p12_keystore: enc_p12_keystore,
